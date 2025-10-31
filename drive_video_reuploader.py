@@ -93,7 +93,8 @@ import sys
 import time
 import logging
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Set, List
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import requests
@@ -165,27 +166,54 @@ def get_file_metadata(drive, file_id: str) -> Dict:
 
 def is_preview_ready(authed_session: AuthorizedSession, meta: Dict) -> Tuple[bool, str]:
     """
-    Returns (ready:bool, reason:str)
-    Ready if both thumbnailLink and videoMediaMetadata exist (metadata says processed)
-    OR HTML probe doesn't contain 'processing' banners and returns a valid viewer page.
+    Returns (ready:bool, reason:str).
+    Relies on Drive metadata (thumbnail + videoMediaMetadata) to confirm processing,
+    and only uses the HTML probe to sharpen the failure reason — never to force a
+    "ready" verdict.
     """
-    if meta.get("thumbnailLink") and meta.get("videoMediaMetadata") and meta.get("videoMediaMetadata", {}).get("processingStatus") == "PROCESSED":
-        return True, "metadata"
+    video_meta = meta.get("videoMediaMetadata") or {}
+    processing_status = (video_meta.get("processingStatus") or "").upper()
+    has_thumbnail = bool(meta.get("thumbnailLink"))
 
-    # HTML probe
+    if processing_status == "FAILED":
+        return False, "metadata:failed"
+    if processing_status == "PROCESSING":
+        return False, "metadata:processing"
+
+    if has_thumbnail and video_meta:
+        if processing_status == "PROCESSED":
+            return True, "metadata:processed"
+        if video_meta.get("width") and video_meta.get("height"):
+            return True, "metadata:dimensions_set"
+
+    meta_reason = None
+    if not has_thumbnail:
+        meta_reason = "metadata:no_thumbnail"
+    elif not video_meta:
+        meta_reason = "metadata:no_video_meta"
+    elif processing_status:
+        meta_reason = f"metadata:{processing_status.lower()}"
+
+    # Metadata says not ready; probe HTML only to enrich the reason
     preview_url = f"https://drive.google.com/file/d/{meta['id']}/preview"
-    resp = authed_session.get(preview_url)
+    try:
+        resp = authed_session.get(preview_url)
+    except Exception as exc:
+        return False, meta_reason or f"html:request_error({exc.__class__.__name__})"
+
     if resp.status_code == 200:
         html = resp.text or ""
         if any(b in html for b in PROCESSING_BANNERS):
             return False, "html:processing_banner"
-        # More thorough check: ensure no processing banners and viewer is present
-        if ("drive-viewer" in html or "video" in html) and not any(b in html for b in PROCESSING_BANNERS):
-            return True, "html:viewer_detected"
-        return False, "html:no_viewer"
+        if "data-errorid" in html:
+            return False, "html:error_banner"
+        if "drive-viewer" in html or "video" in html:
+            return False, meta_reason or "html:viewer_not_ready"
+        return False, meta_reason or "html:no_viewer"
+
     if resp.status_code in (403, 404):
         return False, f"html:perm_or_notfound({resp.status_code})"
-    return False, f"html:status_{resp.status_code}"
+    return False, meta_reason or f"html:status_{resp.status_code}"
 
 
 def audit_upload_health(meta: Dict) -> Dict:
@@ -204,8 +232,8 @@ def audit_upload_health(meta: Dict) -> Dict:
 
 def create_resumable_session(
     authed_session: AuthorizedSession,
-    name: str,
-    mime_type: str,
+    name: Optional[str],
+    mime_type: Optional[str],
     file_id: str = None,
     parent_folder_id: str = None
 ) -> str:
@@ -221,23 +249,26 @@ def create_resumable_session(
         url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true"
     
     headers = {
-        "X-Upload-Content-Type": mime_type,
         "Content-Type": "application/json; charset=UTF-8",
     }
+    if mime_type:
+        headers["X-Upload-Content-Type"] = mime_type
+
+    body: Dict[str, object] = {}
+    if name:
+        body["name"] = name
+    if mime_type:
+        body["mimeType"] = mime_type
     
-    body = {
-        "name": name,
-        "mimeType": mime_type,
-    }
-    
-    if parent_folder_id:
+    if parent_folder_id and not file_id:
         body["parents"] = [parent_folder_id]
     
     # Use PATCH for updates, POST for new files
+    payload = body if body else {}
     if file_id:
-        resp = authed_session.patch(url, headers=headers, json=body)
+        resp = authed_session.patch(url, headers=headers, json=payload)
     else:
-        resp = authed_session.post(url, headers=headers, json=body)
+        resp = authed_session.post(url, headers=headers, json=payload)
         
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"Failed to create resumable session: {resp.status_code} {resp.text}")
@@ -272,6 +303,7 @@ def stream_copy_drive_to_resumable(
         total_size = int(src_resp.headers.get("Content-Length") or 0) or None
 
     start = 0
+    completed_payload: Optional[Dict] = None
     buf = bytearray()
     for chunk in src_resp.iter_content(chunk_size=64 * 1024):  # read small pieces to assemble our fixed CHUNK_SIZE
         if chunk:
@@ -279,9 +311,14 @@ def stream_copy_drive_to_resumable(
             if len(buf) >= chunk_size:
                 # flush a full chunk
                 end = start + chunk_size - 1
-                _resumable_put_with_retry(
+                resp = _resumable_put_with_retry(
                     authed_session, upload_url, bytes(buf[:chunk_size]), start, end, total_size, retry_max
                 )
+                if resp.status_code in (200, 201):
+                    try:
+                        completed_payload = resp.json()
+                    except Exception:
+                        completed_payload = None
                 start = end + 1
                 del buf[:chunk_size]
                 _print_progress(start, total_size)
@@ -289,7 +326,12 @@ def stream_copy_drive_to_resumable(
     # flush remainder
     if len(buf) > 0:
         end = start + len(buf) - 1
-        _resumable_put_with_retry(authed_session, upload_url, bytes(buf), start, end, total_size, retry_max)
+        resp = _resumable_put_with_retry(authed_session, upload_url, bytes(buf), start, end, total_size, retry_max)
+        if resp.status_code in (200, 201):
+            try:
+                completed_payload = resp.json()
+            except Exception:
+                completed_payload = None
         start = end + 1
         _print_progress(start, total_size)
 
@@ -306,6 +348,8 @@ def stream_copy_drive_to_resumable(
             return finalize.json()
         except Exception:
             pass
+    if completed_payload:
+        return completed_payload
     # If finalize didn't return JSON, the previous successful PUT likely did.
     # There's no portable way to fetch the created file id from the session URL,
     # so we instruct caller to re-check via listing or just continue the flow if we have it.
@@ -418,7 +462,17 @@ def save_state(state: Dict):
         json.dump(state, f, indent=2)
 
 
-def scan_folder(drive, authed_session, folder_id: str, folder_name: str, auto_fix: bool = False, keep_versions: bool = False) -> list:
+def scan_folder(
+    drive,
+    authed_session,
+    folder_id: str,
+    folder_name: str,
+    auto_fix: bool = False,
+    keep_versions: bool = False,
+    retry_count: int = 10,
+    retry_delay_seconds: int = 60,
+    preserve_id: bool = True
+) -> list:
     """
     Scans a folder for problematic videos.
     Returns list of problematic video IDs, or fixes them if auto_fix=True.
@@ -435,6 +489,9 @@ def scan_folder(drive, authed_session, folder_id: str, folder_name: str, auto_fi
     cleanup_temp_files(drive, folder_id)
     results = []
     
+    pending_jobs: List[ReuploadJob] = []
+    jobs_with_reports: List[Tuple[ReuploadJob, Dict]] = []
+
     try:
         # List all files in the folder
         query = f"'{folder_id}' in parents and (mimeType contains 'video/')"
@@ -449,53 +506,80 @@ def scan_folder(drive, authed_session, folder_id: str, folder_name: str, auto_fi
         logging.info(f"Found {total_videos} videos to check in {folder_name}")
 
         for idx, file in enumerate(files.get('files', []), 1):
+            process_pending_jobs(pending_jobs, drive, authed_session)
             # Skip files less than 2 days old
             if not is_file_old_enough(file):
                 logging.info(f"\nSkipping {file['name']} - less than 2 days old")
                 continue
-                
-            logging.info(f"\nProcessing File {idx}/{total_videos}")
-            log_video_details(file)
             
-            ready, reason = is_preview_ready(authed_session, file)
+            logging.info(f"\nProcessing File {idx}/{total_videos}")
+            meta = get_file_metadata(drive, file['id'])
+            log_video_details(meta)
+            
+            ready, reason = is_preview_ready(authed_session, meta)
             if ready:
                 logging.info(f"Status: [OK] Playback OK ({reason})")
             else:
                 logging.warning(f"Status: [!!] Problem detected ({reason})")
+                problem_entry = {
+                    'id': file['id'],
+                    'name': meta.get('name', file.get('name', 'unknown')),
+                    'folder': folder_name,
+                    'reason': reason,
+                    'size': meta.get('size', file.get('size', 'unknown')),
+                    'created': meta.get('createdTime', file.get('createdTime', 'unknown')),
+                    'modified': meta.get('modifiedTime', file.get('modifiedTime', 'unknown'))
+                }
+
                 if auto_fix:
                     logging.info(f"Starting auto-fix for {file['name']}")
                     try:
-                        # Use same folder as source for temp, final, and archive
-                        reupload_video(
+                        job = reupload_video(
                             authed_session=authed_session,
                             drive=drive,
                             file_id=file['id'],
-                            temp_folder_id=folder_id,    # Keep in same folder
-                            final_folder_id=folder_id,   # Keep in same folder
-                            archive_folder_id=folder_id, # Archive in same folder
-                            archive_original=True,
+                            temp_folder_id=folder_id,
+                            final_folder_id=folder_id,
+                            archive_folder_id=folder_id,
+                            archive_original=not preserve_id,
                             mime_override="video/mp4",
-                            retry_count=10
+                            retry_count=retry_count,
+                            retry_delay_seconds=retry_delay_seconds,
+                            keep_name=True,
+                            pending_jobs=pending_jobs,
+                            preserve_id=preserve_id,
+                            keep_versions=keep_versions
                         )
-                        logging.info("✅ Fix completed successfully")
+                        jobs_with_reports.append((job, problem_entry))
+                        logging.info(
+                            f"✅ Upload completed for {job.file_id}; preview monitoring queued"
+                        )
                     except Exception as e:
                         logging.error(f"❌ Failed to fix {file['name']}: {e}")
-                results.append({
-                    'id': file['id'],
-                    'name': file['name'],
-                    'folder': folder_name,
-                    'reason': reason,
-                    'size': file.get('size', 'unknown'),
-                    'created': file.get('createdTime', 'unknown'),
-                    'modified': file.get('modifiedTime', 'unknown')
-                })
+                        problem_entry['auto_fix_error'] = str(e)
+                        results.append(problem_entry)
+                else:
+                    results.append(problem_entry)
     except Exception as e:
         print(f"Error scanning folder {folder_id}: {e}")
+    finally:
+        process_pending_jobs(pending_jobs, drive, authed_session, block=True)
+        for job, entry in jobs_with_reports:
+            if job.failed:
+                entry['reason'] = job.last_reason or entry['reason']
+                entry['auto_fix_status'] = 'failed'
+                results.append(entry)
+            elif job.completed:
+                logging.info(f"✅ Auto-fix finalized for {entry['name']} ({job.file_id})")
+            else:
+                entry['auto_fix_status'] = 'unknown'
+                results.append(entry)
     
     return results
 
-def cleanup_temp_files(drive, folder_id: str, original_name: str = None):
+def cleanup_temp_files(drive, folder_id: str, original_name: str = None, exclude_ids: Optional[Set[str]] = None):
     """Clean up temporary files from previous runs or specific file reuploads"""
+    exclude_ids = exclude_ids or set()
     try:
         # Build query based on whether we're cleaning up a specific file or all temp files
         if original_name:
@@ -512,6 +596,9 @@ def cleanup_temp_files(drive, folder_id: str, original_name: str = None):
         ).execute()
         
         for file in files.get('files', []):
+            if file['id'] in exclude_ids:
+                logging.debug(f"Skipping cleanup for active temp file: {file['name']} ({file['id']})")
+                continue
             try:
                 logging.info(f"Cleaning up temp file: {file['name']} (created: {file.get('createdTime', 'unknown')})")
                 delete_file(drive, file['id'])
@@ -549,34 +636,181 @@ def cleanup_old_versions(drive, folder_id: str, file_name: str, keep_latest: boo
     except Exception as e:
         logging.warning(f"Failed to search for old versions: {e}")
 
+
+@dataclass
+class ReuploadJob:
+    file_id: str
+    original_file_id: str
+    preserve_id: bool
+    temp_folder_id: Optional[str]
+    final_folder_id: Optional[str]
+    archive_folder_id: Optional[str]
+    archive_original: bool
+    original_meta: Dict
+    cleanup_base_name: str
+    retry_delay: int
+    attempts_remaining: int
+    keep_versions: bool
+    next_check: float = field(default_factory=time.time)
+    last_reason: Optional[str] = None
+    completed: bool = False
+    failed: bool = False
+
+    def finalize(self, drive, authed_session, new_meta: Dict):
+        if self.preserve_id:
+            logging.info(f"Preview ready for preserved file {self.file_id}")
+            self.completed = True
+            return
+
+        logging.info(f"Moving processed file {self.file_id} into final destination")
+        remove_parent = None
+        if self.temp_folder_id and self.temp_folder_id != self.final_folder_id:
+            remove_parent = self.temp_folder_id
+        move_file(drive, self.file_id, add_parent=self.final_folder_id, remove_parent=remove_parent)
+
+        if self.temp_folder_id:
+            cleanup_temp_files(
+                drive,
+                self.temp_folder_id,
+                original_name=self.cleanup_base_name,
+                exclude_ids={self.file_id}
+            )
+
+        if self.archive_original and self.archive_folder_id:
+            original_parents = self.original_meta.get("parents") or []
+            remove_parent_orig = original_parents[0] if original_parents else None
+            if self.archive_folder_id == remove_parent_orig:
+                remove_parent_orig = None
+            move_file(
+                drive,
+                self.original_file_id,
+                add_parent=self.archive_folder_id,
+                remove_parent=remove_parent_orig
+            )
+            if not self.keep_versions and self.archive_folder_id:
+                cleanup_old_versions(drive, self.archive_folder_id, self.original_meta.get("name", ""), keep_latest=True)
+        elif self.archive_original:
+            logging.warning("archive_original requested but no archive_folder_id supplied; skipping archive step")
+        else:
+            delete_file(drive, self.original_file_id)
+            if not self.keep_versions and self.final_folder_id:
+                cleanup_old_versions(drive, self.final_folder_id, new_meta.get("name", ""), keep_latest=True)
+
+        self.completed = True
+
+    def check_once(self, drive, authed_session) -> Tuple[str, str]:
+        try:
+            new_meta = get_file_metadata(drive, self.file_id)
+            ready, reason = is_preview_ready(authed_session, new_meta)
+        except Exception as exc:
+            ready = False
+            reason = f"poll_error:{exc.__class__.__name__}"
+            new_meta = {}
+
+        if ready:
+            logging.info(f"Preview ready for file {self.file_id} ({reason})")
+            self.finalize(drive, authed_session, new_meta)
+            return "ready", reason
+
+        self.attempts_remaining -= 1
+        self.last_reason = reason
+        if self.attempts_remaining <= 0:
+            logging.error(f"FAILED: Preview never became ready for {self.file_id} ({reason})")
+            self.failed = True
+            return "failed", reason
+
+        self.next_check = time.time() + self.retry_delay
+        logging.info(
+            f"Preview not ready yet for {self.file_id} ({reason}). Will retry in {self.retry_delay}s"
+        )
+        return "pending", reason
+
+    def block_until_ready(self, drive, authed_session) -> bool:
+        while True:
+            status, _ = self.check_once(drive, authed_session)
+            if status == "ready":
+                return True
+            if status == "failed":
+                return False
+            time.sleep(self.retry_delay)
+
+
+def process_pending_jobs(pending_jobs: List[ReuploadJob], drive, authed_session, block: bool = False):
+    if not pending_jobs:
+        return
+
+    while pending_jobs:
+        now = time.time()
+        triggered = False
+        for job in list(pending_jobs):
+            if now >= job.next_check:
+                status, _ = job.check_once(drive, authed_session)
+                triggered = True
+                if status in ("ready", "failed"):
+                    pending_jobs.remove(job)
+
+        if not block:
+            break
+
+        if triggered:
+            continue
+
+        if not pending_jobs:
+            break
+
+        next_due = min(job.next_check for job in pending_jobs)
+        sleep_for = max(0.5, next_due - time.time())
+        min_delay = min(job.retry_delay for job in pending_jobs)
+        time.sleep(min(sleep_for, max(1.0, min_delay)))
+
 def reupload_video(
     authed_session: AuthorizedSession,
     drive,
     file_id: str,
-    temp_folder_id: str,
-    final_folder_id: str,
-    archive_folder_id: str,
+    temp_folder_id: Optional[str],
+    final_folder_id: Optional[str],
+    archive_folder_id: Optional[str],
     archive_original: bool = True,
     mime_override: str = "video/mp4",
-    retry_count: int = 10
-) -> bool:
-    """Helper function to reupload a single video with the standard parameters"""
+    retry_count: int = 10,
+    retry_delay_seconds: int = 60,
+    keep_name: bool = False,
+    pending_jobs: Optional[List[ReuploadJob]] = None,
+    preserve_id: bool = True,
+    keep_versions: bool = False
+) -> ReuploadJob:
+    """Upload replacement media and return a monitor job for preview readiness."""
     meta = get_file_metadata(drive, file_id)
     size = int(meta.get("size") or 0) or None
-    
-    # Decide target MIME and name
+
+    if preserve_id and archive_original:
+        logging.warning("archive_original ignored because --preserve-id=true keeps the same Drive ID")
+        archive_original = False
+
+    if not preserve_id and (not temp_folder_id or not final_folder_id):
+        raise RuntimeError("temp_folder_id and final_folder_id are required when not preserving the file ID")
+
     target_mime = mime_override or meta.get("mimeType", "video/mp4")
     base_name = meta.get("name", f"{file_id}.mp4")
-    new_name = _append_suffix_before_ext(base_name, "-reupload")
+    new_name = base_name if keep_name else _append_suffix_before_ext(base_name, "-reupload")
 
-    # Start update upload
-    print(f"Starting update of '{base_name}'...")
-    upload_url = create_resumable_session(
-        authed_session=authed_session,
-        name=new_name,
-        mime_type=target_mime,
-        file_id=file_id  # Update existing file
-    )
+    logging.info(f"Starting reupload of '{base_name}' (preserve_id={preserve_id})")
+
+    if preserve_id:
+        session_name = new_name if new_name != base_name else None
+        upload_url = create_resumable_session(
+            authed_session=authed_session,
+            name=session_name,
+            mime_type=target_mime,
+            file_id=file_id
+        )
+    else:
+        upload_url = create_resumable_session(
+            authed_session=authed_session,
+            name=new_name,
+            mime_type=target_mime,
+            parent_folder_id=temp_folder_id
+        )
 
     new_file_json = stream_copy_drive_to_resumable(
         authed_session=authed_session,
@@ -586,55 +820,36 @@ def reupload_video(
         chunk_size=CHUNK_SIZE,
         retry_max=5
     )
-    
-    new_file_id = new_file_json.get("id")
-    if not new_file_id:
-        raise RuntimeError("Upload completed but no new file ID returned")
 
-    # Poll preview and move files
-    total_wait_time = retry_count * 60  # Total wait time in seconds
-    logging.info(f"Starting preview check - will try for up to {total_wait_time/60:.1f} minutes")
-    logging.info(f"File ID being checked: {new_file_id}")
-    
-    for i in range(retry_count):
-        try:
-            new_meta = get_file_metadata(drive, new_file_id)
-            ok, why = is_preview_ready(authed_session, new_meta)
-            if ok:
-                logging.info(f"Preview became available after {(i+1)*60} seconds")
-                logging.info(f"Moving file {new_file_id} to final folder {final_folder_id}")
-                
-                # Verify file exists before moving
-                try:
-                    verify_meta = get_file_metadata(drive, new_file_id)
-                    if not verify_meta:
-                        raise RuntimeError(f"File {new_file_id} not found before move operation")
-                    
-                    # Move new file to final folder
-                    move_file(drive, new_file_id, add_parent=final_folder_id, remove_parent=temp_folder_id)
-                    logging.info(f"Successfully moved file to final folder")
-                except Exception as move_error:
-                    logging.error(f"Failed to move file: {move_error}")
-                    raise
-                
-                # Clean up any temporary files for this video
-                cleanup_temp_files(drive, temp_folder_id, original_name=base_name)
-                
-                # Archive or delete original and clean up old versions
-                if archive_original:
-                    move_file(drive, file_id, add_parent=archive_folder_id, 
-                            remove_parent=meta.get("parents", [None])[0])
-                    cleanup_old_versions(drive, archive_folder_id, meta["name"], keep_latest=True)
-                else:
-                    delete_file(drive, file_id)
-                    cleanup_old_versions(drive, final_folder_id, new_meta["name"], keep_latest=True)
-                
-                return True
-        except Exception as e:
-            print(f"Preview poll error: {e}")
-        time.sleep(30)  # 30 second delay between retries
-    
-    return False
+    new_file_id = new_file_json.get("id") if isinstance(new_file_json, dict) else None
+    if preserve_id:
+        new_file_id = file_id
+    if not new_file_id:
+        raise RuntimeError("Upload completed but no file ID returned; cannot continue")
+
+    job = ReuploadJob(
+        file_id=new_file_id,
+        original_file_id=file_id,
+        preserve_id=preserve_id,
+        temp_folder_id=temp_folder_id if not preserve_id else None,
+        final_folder_id=final_folder_id if not preserve_id else meta.get("parents", [None])[0],
+        archive_folder_id=archive_folder_id if not preserve_id else None,
+        archive_original=archive_original if not preserve_id else False,
+        original_meta=meta,
+        cleanup_base_name=base_name,
+        retry_delay=retry_delay_seconds,
+        attempts_remaining=retry_count,
+        keep_versions=keep_versions
+    )
+
+    if pending_jobs is not None:
+        pending_jobs.append(job)
+        logging.info(
+            f"Upload finished for {new_file_id}. Monitoring preview readiness asynchronously "
+            f"({retry_count} attempts, every {retry_delay_seconds}s)."
+        )
+
+    return job
 
 def log_video_details(file_info: dict, log: logging.Logger = logging) -> None:
     """Log detailed information about a video file."""
@@ -710,6 +925,7 @@ def main():
     ap.add_argument("--keep-name", default="false", choices=["true", "false"], help="Keep exact original name (else append -reupload)")
     ap.add_argument("--dry-run", default="false", choices=["true", "false"], help="Only report status; do not modify")
     ap.add_argument("--keep-versions", default="false", choices=["true", "false"], help="Keep old versions when fixing videos")
+    ap.add_argument("--preserve-id", default="true", choices=["true", "false"], help="Overwrite the existing file ID instead of creating a new file")
     args = ap.parse_args()
 
     file_id = parse_file_id(args.file) if args.file else None
@@ -717,6 +933,7 @@ def main():
     keep_name = args.keep_name == "true"
     dry_run = args.dry_run == "true"
     keep_versions = args.keep_versions == "true"
+    preserve_id = args.preserve_id == "true"
 
     # Setup logging
     log_file = setup_logging()
@@ -729,13 +946,17 @@ def main():
     
     # Validate arguments based on mode
     if args.file and not args.scan_folders:
-        # Only enforce folder arguments for single file mode
-        if not args.temp_folder or not args.final_folder:
-            logging.error("--temp-folder and --final-folder are required for single file mode")
-            sys.exit(2)
-        if archive_original and not args.archive_folder:
-            logging.error("--archive-folder is required when --archive-original=true in single file mode")
-            sys.exit(2)
+        if preserve_id:
+            if archive_original:
+                logging.error("Cannot archive the original when --preserve-id=true. Disable archiving or set --preserve-id=false.")
+                sys.exit(2)
+        else:
+            if not args.temp_folder or not args.final_folder:
+                logging.error("--temp-folder and --final-folder are required for single file mode when --preserve-id=false")
+                sys.exit(2)
+            if archive_original and not args.archive_folder:
+                logging.error("--archive-folder is required when --archive-original=true and --preserve-id=false")
+                sys.exit(2)
 
     authed_session, drive = setup_auth()
     logging.info("Authentication successful")
@@ -755,7 +976,17 @@ def main():
             folder_name = env_key.replace('DRIVE_FOLDER_', '')
             logging.info(f"\nProcessing folder {folder_name}")
             logging.info(f"Using folder ID {folder_id} for operations (temp/final/archive)")
-            problems = scan_folder(drive, authed_session, folder_id, folder_name, args.auto_fix, keep_versions)
+            problems = scan_folder(
+                drive,
+                authed_session,
+                folder_id,
+                folder_name,
+                args.auto_fix,
+                keep_versions,
+                retry_count=args.retry_count,
+                retry_delay_seconds=args.retry_delay_seconds,
+                preserve_id=preserve_id
+            )
             if problems:
                 print(f"\n📁 Found {len(problems)} problematic videos in {folder_name}")
                 all_problems.extend(problems)
@@ -822,74 +1053,49 @@ def main():
         sys.exit(0)
 
     # Decide target MIME
-    target_mime = args.mime_override or ( "video/mp4" if health["badMime"] else meta.get("mimeType", "video/mp4") )
-    # Decide new name
-    base_name = meta.get("name", f"{file_id}.mp4")
-    new_name = base_name if keep_name else _append_suffix_before_ext(base_name, "-reupload")
+    target_mime = args.mime_override or ("video/mp4" if health["badMime"] else meta.get("mimeType", "video/mp4"))
 
-    print(f"Starting Drive→Drive streaming re-upload as '{new_name}' with MIME '{target_mime}'...")
-    upload_url = create_resumable_session(authed_session, new_name, target_mime, args.temp_folder)
-
-    new_file_json = stream_copy_drive_to_resumable(
-        authed_session=authed_session,
-        source_file_id=file_id,
-        upload_url=upload_url,
-        total_size=size,
-        chunk_size=CHUNK_SIZE,
-        retry_max=5
+    print(
+        f"Preparing Drive→Drive streaming re-upload (mime='{target_mime}', preserve_id={preserve_id})..."
     )
-    new_file_id = new_file_json.get("id")
-    if not new_file_id:
-        print("ERROR: Upload completed but no new file ID returned. Exiting.", file=sys.stderr)
-        sys.exit(1)
 
-    print("\nUpload finished. New file ID:", new_file_id)
+    job = reupload_video(
+        authed_session=authed_session,
+        drive=drive,
+        file_id=file_id,
+        temp_folder_id=args.temp_folder,
+        final_folder_id=args.final_folder,
+        archive_folder_id=args.archive_folder,
+        archive_original=archive_original,
+        mime_override=target_mime,
+        retry_count=args.retry_count,
+        retry_delay_seconds=args.retry_delay_seconds,
+        keep_name=keep_name,
+        pending_jobs=None,
+        preserve_id=preserve_id,
+        keep_versions=keep_versions
+    )
 
-    # Poll preview
-    for i in range(args.retry_count):
-        try:
-            new_meta = get_file_metadata(drive, new_file_id)
-            ok, why = is_preview_ready(authed_session, new_meta)
-            if ok:
-                print(f"New file is previewable ({why}).")
-                break
-            else:
-                print(f"Preview not ready yet ({why}). Retry {i+1}/{args.retry_count} in {args.retry_delay_seconds}s ...")
-        except Exception as e:
-            print(f"Preview poll error: {e}. Retry {i+1}/{args.retry_count} in {args.retry_delay_seconds}s ...")
-        time.sleep(args.retry_delay_seconds)
-    else:
-        print("FAILED: New file never became previewable within retry window. Leaving both files intact.")
-        # record mapping anyway for future runs
-        state[file_id] = {"new_file_id": new_file_id, "ts": int(time.time())}
+    print("\nUpload finished. Monitoring preview status ...")
+    success = job.block_until_ready(drive, authed_session)
+    if not success:
+        state[file_id] = {"new_file_id": job.file_id, "ts": int(time.time()), "preserve_id": preserve_id}
         save_state(state)
+        print("FAILED: Replacement never became previewable within retry window.")
         sys.exit(1)
 
-    # Clean up any remaining temp files
-    cleanup_temp_files(drive, args.temp_folder)
-    
-    # Move new file to final folder (remove temp)
-    print("Moving new file to final folder ...")
-    move_file(drive, new_file_id, add_parent=args.final_folder, remove_parent=args.temp_folder)
-
-    # Archive or delete original
-    if archive_original:
-        print("Archiving original file ...")
-        move_file(drive, file_id, add_parent=args.archive_folder, remove_parent=meta.get("parents", [None])[0])
-    else:
-        print("Deleting original file ...")
-        delete_file(drive, file_id)
-
-    # Save mapping
-    state[file_id] = {"new_file_id": new_file_id, "ts": int(time.time())}
+    final_meta = get_file_metadata(drive, job.file_id)
+    state[file_id] = {"new_file_id": job.file_id, "ts": int(time.time()), "preserve_id": preserve_id}
     save_state(state)
 
     print("SUCCESS")
     print(f"original_file_id={file_id}")
     print(f"original_name={meta.get('name')}")
-    print(f"new_file_id={new_file_id}")
-    print(f"new_name={new_name}")
-    print(f"final_folder_id={args.final_folder}")
+    print(f"new_file_id={job.file_id}")
+    print(f"new_name={final_meta.get('name')}")
+    parents = final_meta.get('parents', [])
+    if parents:
+        print(f"final_folder_id={parents[0]}")
     print("status=success")
 
 

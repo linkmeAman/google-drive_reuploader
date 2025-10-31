@@ -8,8 +8,9 @@ A Python tool that fixes non-previewable videos in Google Drive by re-uploading 
 - **Zero Disk Usage**: Streams files directly between Google Drive
 - **Memory Efficient**: Uses only ~16MB RAM regardless of video size
 - **Smart Processing**: Detects and fixes videos with preview issues
+- **Parallel Preview Monitoring**: Uploads continue in the background while the script scans the next videos
 - **Detailed Logging**: Tracks all operations with timestamps
-- **File Safety**: Updates files in-place while preserving IDs and permissions
+- **Flexible File Handling**: Preserve the original Drive ID by default or opt-in to generate a fresh copy
 
 ## Setup
 
@@ -56,9 +57,19 @@ python drive_video_reuploader.py --scan-folders --auto-fix
 ```
 
 ### 2. Single File Mode
-Fix a specific video:
+Fix a specific video while keeping its Drive ID (default behaviour):
 ```powershell
-python drive_video_reuploader.py --file "1HfkJOA72po-ykYoVq617WQk0wxiNl6zD" --temp-folder "14JYr4ugdFnp-wAGnC32mkTh1DyLeYMUv" --final-folder "14JYr4ugdFnp-wAGnC32mkTh1DyLeYMUv"
+python drive_video_reuploader.py --file "1HfkJOA72po-ykYoVq617WQk0wxiNl6zD"
+```
+
+Create a brand-new file ID instead (requires staging folders):
+```powershell
+python drive_video_reuploader.py --file "1HfkJOA72po-ykYoVq617WQk0wxiNl6zD" ^
+  --preserve-id false ^
+  --temp-folder "14JYr4ugdFnp-wAGnC32mkTh1DyLeYMUv" ^
+  --final-folder "14JYr4ugdFnp-wAGnC32mkTh1DyLeYMUv" ^
+  --archive-original true ^
+  --archive-folder "1A2B3CArchiveFolder"
 ```
 
 ## How It Works
@@ -66,9 +77,9 @@ python drive_video_reuploader.py --file "1HfkJOA72po-ykYoVq617WQk0wxiNl6zD" --te
 ### Process Flow
 1. **Scanning**: Checks each video in configured folders
 2. **Detection**: Identifies videos with preview problems
-3. **Update**: Streams and updates problematic videos in-place through Drive API
-4. **Verification**: Ensures updated video is properly processed
-5. **Cleanup**: Removes any temporary files
+3. **Update**: Streams and updates problematic videos through the Drive API
+4. **Asynchronous Monitoring**: Preview readiness is polled in the background so the scan can keep moving
+5. **Verification & Cleanup**: Once Drive reports a PROCESSED status, the script finalises moves/archival and removes temporary artifacts
 
 ### Logging
 - Detailed logs stored in `logs` directory
@@ -76,9 +87,14 @@ python drive_video_reuploader.py --file "1HfkJOA72po-ykYoVq617WQk0wxiNl6zD" --te
 - Tracks all operations and their results
 
 ### File Management
-- **Temporary Files**: Created during update process, automatically cleaned up
-- **File IDs**: Preserved during update process
-- **Processing**: Files are updated in-place, maintaining original location and ID
+- **Temporary Files**: Only needed when creating a brand-new file ID; the cleanup logic skips active uploads and removes leftovers afterwards
+- **File IDs**: Preserved by default; switch `--preserve-id=false` to stage a brand-new copy
+- **Processing**: Files are updated in-place, so sharing links, permissions, and automations stay intact unless you opt into the new-ID mode
+
+### Advanced Options
+- `--retry-count` / `--retry-delay-seconds`: Tune how long preview polling should continue (useful for multi-GB uploads)
+- `--auto-fix`: When scanning folders, automatically trigger reuploads and let the background monitor finish them
+- `--keep-versions`: Retain old revisions when creating new IDs instead of trimming stale copies
 
 ## Tips
 - Use `--scan-folders` for automated checking of all folders
