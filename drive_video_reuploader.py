@@ -174,25 +174,31 @@ def is_preview_ready(authed_session: AuthorizedSession, meta: Dict) -> Tuple[boo
     video_meta = meta.get("videoMediaMetadata") or {}
     processing_status = (video_meta.get("processingStatus") or "").upper()
     has_thumbnail = bool(meta.get("thumbnailLink"))
+    has_dimensions = bool(video_meta.get("width") and video_meta.get("height"))
 
     if processing_status == "FAILED":
         return False, "metadata:failed"
     if processing_status == "PROCESSING":
-        return False, "metadata:processing"
-
-    if has_thumbnail and video_meta:
-        if processing_status == "PROCESSED":
-            return True, "metadata:processed"
-        if video_meta.get("width") and video_meta.get("height"):
-            return True, "metadata:dimensions_set"
-
-    meta_reason = None
-    if not has_thumbnail:
-        meta_reason = "metadata:no_thumbnail"
+        meta_reason = "metadata:processing"
+        meta_ready = False
+    elif processing_status == "PROCESSED":
+        meta_reason = "metadata:processed"
+        meta_ready = True
     elif not video_meta:
         meta_reason = "metadata:no_video_meta"
+        meta_ready = False
+    elif not has_thumbnail:
+        meta_reason = "metadata:no_thumbnail"
+        meta_ready = False
+    elif has_dimensions:
+        meta_reason = "metadata:dimensions_only"
+        meta_ready = False
     elif processing_status:
         meta_reason = f"metadata:{processing_status.lower()}"
+        meta_ready = False
+    else:
+        meta_reason = "metadata:unknown"
+        meta_ready = False
 
     # Metadata says not ready; probe HTML only to enrich the reason
     preview_url = f"https://drive.google.com/file/d/{meta['id']}/preview"
@@ -207,12 +213,16 @@ def is_preview_ready(authed_session: AuthorizedSession, meta: Dict) -> Tuple[boo
             return False, "html:processing_banner"
         if "data-errorid" in html:
             return False, "html:error_banner"
+        if meta_ready:
+            return True, meta_reason or "metadata:processed"
         if "drive-viewer" in html or "video" in html:
             return False, meta_reason or "html:viewer_not_ready"
         return False, meta_reason or "html:no_viewer"
 
     if resp.status_code in (403, 404):
         return False, f"html:perm_or_notfound({resp.status_code})"
+    if meta_ready:
+        return True, meta_reason or "metadata:processed"
     return False, meta_reason or f"html:status_{resp.status_code}"
 
 
@@ -469,8 +479,8 @@ def scan_folder(
     folder_name: str,
     auto_fix: bool = False,
     keep_versions: bool = False,
-    retry_count: int = 10,
-    retry_delay_seconds: int = 60,
+    retry_count: int = 2,
+    retry_delay_seconds: int = 600,
     preserve_id: bool = True
 ) -> list:
     """
@@ -772,8 +782,8 @@ def reupload_video(
     archive_folder_id: Optional[str],
     archive_original: bool = True,
     mime_override: str = "video/mp4",
-    retry_count: int = 10,
-    retry_delay_seconds: int = 60,
+    retry_count: int = 2,
+    retry_delay_seconds: int = 600,
     keep_name: bool = False,
     pending_jobs: Optional[List[ReuploadJob]] = None,
     preserve_id: bool = True,
