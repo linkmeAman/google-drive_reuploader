@@ -53,7 +53,8 @@ Checks all configured folders for problematic videos:
 python drive_video_reuploader.py --scan-folders
 
 # Scan and automatically fix issues
-python drive_video_reuploader.py --scan-folders --auto-fix
+python drive_video_reuploader.py --scan-folders --auto-fix 
+With preview python drive_video_reuploader.py --scan-folders --auto-fix --open-preview
 ```
 
 ### 2. Single File Mode
@@ -95,6 +96,7 @@ python drive_video_reuploader.py --file "1HfkJOA72po-ykYoVq617WQk0wxiNl6zD" ^
 - `--retry-count` / `--retry-delay-seconds`: Tune how long preview polling should continue (useful for multi-GB uploads)
 - `--auto-fix`: When scanning folders, automatically trigger reuploads and let the background monitor finish them
 - `--keep-versions`: Retain old revisions when creating new IDs instead of trimming stale copies
+- `--open-preview`: After each re-upload, open the Google Drive preview page in your default browser so you can watch the processing banner clear in real time
 
 ## Tips
 - Use `--scan-folders` for automated checking of all folders

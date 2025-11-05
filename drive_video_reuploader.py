@@ -92,6 +92,7 @@ import re
 import sys
 import time
 import logging
+import webbrowser
 from datetime import datetime
 from typing import Dict, Optional, Tuple, Set, List
 from dataclasses import dataclass, field
@@ -118,6 +119,23 @@ PROCESSING_BANNERS = [
     "Please try again later, or contact support if this issue persists",
     "If you trust the file, you can download it for offline playback"
 ]
+
+
+def open_preview_in_browser(file_id: str, log: logging.Logger = logging) -> str:
+    """
+    Launch the Google Drive preview page in the user's default browser.
+    Returns the preview URL so callers can surface it elsewhere.
+    """
+    preview_url = f"https://drive.google.com/file/d/{file_id}/preview"
+    try:
+        opened = webbrowser.open(preview_url, new=2)
+        if opened:
+            log.info(f"Opened Drive preview in browser: {preview_url}")
+        else:
+            log.info(f"Preview URL ready (browser reported no new tab): {preview_url}")
+    except webbrowser.Error as exc:
+        log.warning(f"Could not launch browser automatically: {exc}. Preview URL: {preview_url}")
+    return preview_url
 
 
 def setup_auth() -> Tuple[AuthorizedSession, object]:
@@ -481,7 +499,8 @@ def scan_folder(
     keep_versions: bool = False,
     retry_count: int = 2,
     retry_delay_seconds: int = 600,
-    preserve_id: bool = True
+    preserve_id: bool = True,
+    open_preview: bool = False
 ) -> list:
     """
     Scans a folder for problematic videos.
@@ -564,6 +583,9 @@ def scan_folder(
                         logging.info(
                             f"✅ Upload completed for {job.file_id}; preview monitoring queued"
                         )
+                        if open_preview:
+                            preview_url = open_preview_in_browser(job.file_id)
+                            print(f"Preview URL for {file['name']}: {preview_url}")
                     except Exception as e:
                         logging.error(f"❌ Failed to fix {file['name']}: {e}")
                         problem_entry['auto_fix_error'] = str(e)
@@ -936,6 +958,7 @@ def main():
     ap.add_argument("--dry-run", default="false", choices=["true", "false"], help="Only report status; do not modify")
     ap.add_argument("--keep-versions", default="false", choices=["true", "false"], help="Keep old versions when fixing videos")
     ap.add_argument("--preserve-id", default="true", choices=["true", "false"], help="Overwrite the existing file ID instead of creating a new file")
+    ap.add_argument("--open-preview", action="store_true", help="Open the Drive preview page in your default browser after a re-upload starts")
     args = ap.parse_args()
 
     file_id = parse_file_id(args.file) if args.file else None
@@ -995,7 +1018,8 @@ def main():
                 keep_versions,
                 retry_count=args.retry_count,
                 retry_delay_seconds=args.retry_delay_seconds,
-                preserve_id=preserve_id
+                preserve_id=preserve_id,
+                open_preview=args.open_preview
             )
             if problems:
                 print(f"\n📁 Found {len(problems)} problematic videos in {folder_name}")
@@ -1085,6 +1109,10 @@ def main():
         preserve_id=preserve_id,
         keep_versions=keep_versions
     )
+
+    if args.open_preview:
+        preview_url = open_preview_in_browser(job.file_id)
+        print(f"Preview URL: {preview_url}")
 
     print("\nUpload finished. Monitoring preview status ...")
     success = job.block_until_ready(drive, authed_session)
