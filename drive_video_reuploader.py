@@ -119,6 +119,7 @@ PROCESSING_BANNERS = [
     "Please try again later, or contact support if this issue persists",
     "If you trust the file, you can download it for offline playback"
 ]
+PROCESSING_BANNERS_LOWER = [b.lower() for b in PROCESSING_BANNERS]
 
 
 def open_preview_in_browser(file_id: str, log: logging.Logger = logging) -> str:
@@ -136,6 +137,18 @@ def open_preview_in_browser(file_id: str, log: logging.Logger = logging) -> str:
     except webbrowser.Error as exc:
         log.warning(f"Could not launch browser automatically: {exc}. Preview URL: {preview_url}")
     return preview_url
+
+
+def prime_preview_processing(authed_session: AuthorizedSession, file_id: str, log: logging.Logger = logging) -> None:
+    """
+    Hit the Drive preview page once to kick off processing without requiring a manual browser visit.
+    """
+    preview_url = f"https://drive.google.com/file/d/{file_id}/preview"
+    try:
+        resp = authed_session.get(preview_url, timeout=15)
+        log.info(f"Preview primed for file {file_id} (status {resp.status_code})")
+    except Exception as exc:
+        log.warning(f"Preview priming failed for {file_id}: {exc}")
 
 
 def setup_auth() -> Tuple[AuthorizedSession, object]:
@@ -185,63 +198,86 @@ def get_file_metadata(drive, file_id: str) -> Dict:
 def is_preview_ready(authed_session: AuthorizedSession, meta: Dict) -> Tuple[bool, str]:
     """
     Returns (ready:bool, reason:str).
-    Relies on Drive metadata (thumbnail + videoMediaMetadata) to confirm processing,
-    and only uses the HTML probe to sharpen the failure reason — never to force a
-    "ready" verdict.
+    Uses Drive metadata when available and trusts the viewer HTML when the player
+    is present without processing/error banners. This avoids false negatives that
+    previously required manually opening the preview page.
     """
     video_meta = meta.get("videoMediaMetadata") or {}
     processing_status = (video_meta.get("processingStatus") or "").upper()
     has_thumbnail = bool(meta.get("thumbnailLink"))
     has_dimensions = bool(video_meta.get("width") and video_meta.get("height"))
+    has_duration = bool(video_meta.get("durationMillis"))
+    preview_url = f"https://drive.google.com/file/d/{meta['id']}/preview"
 
     if processing_status == "FAILED":
         return False, "metadata:failed"
-    if processing_status == "PROCESSING":
-        meta_reason = "metadata:processing"
-        meta_ready = False
-    elif processing_status == "PROCESSED":
+
+    meta_ready_hint = False
+    if processing_status == "PROCESSED":
+        meta_ready_hint = True
         meta_reason = "metadata:processed"
-        meta_ready = True
-    elif not video_meta:
-        meta_reason = "metadata:no_video_meta"
-        meta_ready = False
-    elif not has_thumbnail:
-        meta_reason = "metadata:no_thumbnail"
-        meta_ready = False
-    elif has_dimensions:
-        meta_reason = "metadata:dimensions_only"
-        meta_ready = False
+    elif processing_status == "PROCESSING":
+        meta_reason = "metadata:processing"
     elif processing_status:
         meta_reason = f"metadata:{processing_status.lower()}"
-        meta_ready = False
+    elif has_thumbnail and has_dimensions:
+        meta_ready_hint = True
+        meta_reason = "metadata:thumb_and_dims"
+    elif has_thumbnail:
+        meta_reason = "metadata:thumbnail_only"
+    elif has_dimensions or has_duration:
+        meta_reason = "metadata:dimensions_only"
+    elif not video_meta:
+        meta_reason = "metadata:no_video_meta"
     else:
         meta_reason = "metadata:unknown"
-        meta_ready = False
 
-    # Metadata says not ready; probe HTML only to enrich the reason
-    preview_url = f"https://drive.google.com/file/d/{meta['id']}/preview"
+    html_ready = False
+    html_reason = None
+
     try:
-        resp = authed_session.get(preview_url)
+        resp = authed_session.get(preview_url, timeout=20)
     except Exception as exc:
-        return False, meta_reason or f"html:request_error({exc.__class__.__name__})"
+        return False, f"html:request_error({exc.__class__.__name__})"
 
     if resp.status_code == 200:
         html = resp.text or ""
-        if any(b in html for b in PROCESSING_BANNERS):
-            return False, "html:processing_banner"
-        if "data-errorid" in html:
-            return False, "html:error_banner"
-        if meta_ready:
-            return True, meta_reason or "metadata:processed"
-        if "drive-viewer" in html or "video" in html:
-            return False, meta_reason or "html:viewer_not_ready"
-        return False, meta_reason or "html:no_viewer"
+        html_lower = html.lower()
+        if any(b in html_lower for b in PROCESSING_BANNERS_LOWER):
+            html_reason = "html:processing_banner"
+        elif "data-errorid" in html_lower:
+            html_reason = "html:error_banner"
+        elif "drive-viewer-video-player" in html_lower or "<video" in html_lower:
+            html_ready = True
+            html_reason = "html:viewer_ready"
+        elif "drive-viewer" in html_lower:
+            html_reason = "html:viewer_shell"
+        else:
+            html_reason = "html:unknown_200"
+    elif resp.status_code in (403, 404):
+        html_reason = f"html:perm_or_notfound({resp.status_code})"
+    else:
+        html_reason = f"html:status_{resp.status_code}"
 
-    if resp.status_code in (403, 404):
-        return False, f"html:perm_or_notfound({resp.status_code})"
-    if meta_ready:
-        return True, meta_reason or "metadata:processed"
-    return False, meta_reason or f"html:status_{resp.status_code}"
+    # Processing/error banners always win
+    if html_reason in ("html:processing_banner", "html:error_banner") or (
+        html_reason and html_reason.startswith("html:perm_or_notfound")
+    ):
+        return False, html_reason
+
+    if html_ready:
+        return True, html_reason
+
+    if meta_ready_hint:
+        return True, meta_reason
+
+    if processing_status == "PROCESSING":
+        return False, meta_reason
+
+    if html_reason:
+        return False, html_reason
+
+    return False, meta_reason
 
 
 def audit_upload_health(meta: Dict) -> Dict:
@@ -858,6 +894,9 @@ def reupload_video(
         new_file_id = file_id
     if not new_file_id:
         raise RuntimeError("Upload completed but no file ID returned; cannot continue")
+
+    # Prime the preview so Drive's transcoder starts without a manual browser visit
+    prime_preview_processing(authed_session, new_file_id)
 
     job = ReuploadJob(
         file_id=new_file_id,
