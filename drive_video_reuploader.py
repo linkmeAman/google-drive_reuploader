@@ -992,7 +992,7 @@ def main():
     ap.add_argument("--archive-folder", default=None, help="Archive folder ID (required if --archive-original=true)")
     ap.add_argument("--mime-override", default=None, help="Force MIME type on upload (e.g., video/mp4)")
     ap.add_argument("--retry-count", type=int, default=12, help="Preview poll retries (default: 12)")
-    ap.add_argument("--retry-delay-seconds", type=int, default=60, help="Delay between preview polls in seconds (default: 60)")
+    ap.add_argument("--retry-delay-seconds", type=int, default=180, help="Delay between preview polls in seconds (default: 180)")
     ap.add_argument("--keep-name", default="false", choices=["true", "false"], help="Keep exact original name (else append -reupload)")
     ap.add_argument("--dry-run", default="false", choices=["true", "false"], help="Only report status; do not modify")
     ap.add_argument("--keep-versions", default="false", choices=["true", "false"], help="Keep old versions when fixing videos")
